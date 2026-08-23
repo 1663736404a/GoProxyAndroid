@@ -19,15 +19,21 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
-
-[dev-dependencies]
-# 单测要 #[tokio::test]（macros）和 pause/advance 之外的真实定时（time 已在上面）
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 bytes = "1"
 async-stream = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 jni = "0.21"
+
+# 注意：这一节必须留在 [dependencies] **之后**。
+# 之前把它插在 [dependencies] 中间，导致其后的 reqwest / bytes /
+# async-stream / futures-util / jni 全部被归进 dev-dependencies，
+# 库本体因此缺依赖，`cargo ndk build --lib` 直接失败（exit 101）。
+# 而 `cargo test` 反而是通的（测试编译时 dev-deps 可见），
+# 所以 CI 的 "Run unit tests" 步骤成功、下一步交叉编译才炸。
+[dev-dependencies]
+# 单测要 #[tokio::test]（macros）；test-util 提供超时相关工具
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
 
 [profile.release]
 opt-level = "z"       # 优先压体积
