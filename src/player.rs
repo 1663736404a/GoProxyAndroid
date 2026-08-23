@@ -180,7 +180,12 @@ impl Player {
                             Err(e) => last_err = format!("读取响应体失败: {e}"),
                         }
                     } else {
-                        last_err = format!("状态码: {}", status.as_u16());
+                        last_err = describe_upstream_status(status.as_u16());
+                        // 鉴权/前置条件类错误重试无意义：换多少次请求头都一样，
+                        // 只会让播放器多等 1.5s 才拿到错误。直接失败。
+                        if is_terminal_status(status.as_u16()) {
+                            return Err(last_err);
+                        }
                     }
                 }
                 Err(e) => last_err = e.to_string(),
@@ -224,7 +229,20 @@ impl Player {
         {
             Ok(v) => v,
             Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("首块下载失败: {e}")).into_response()
+                // 附上收到的请求头名单：鉴权类失败最常见的原因就是调用方
+                // 没把 Cookie 传进来，这样一眼能看出是 header 少了还是真失效。
+                let names = if self.header.is_empty() {
+                    "（无）".to_string()
+                } else {
+                    let mut v: Vec<&str> = self.header.keys().map(|k| k.as_str()).collect();
+                    v.sort_unstable();
+                    v.join(", ")
+                };
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("首块下载失败: {e}；本次转发的请求头: [{names}]"),
+                )
+                    .into_response();
             }
         };
 
@@ -412,6 +430,41 @@ impl Player {
         };
         *response.headers_mut() = resp_headers;
         response
+    }
+}
+
+/// 上游状态码是否"重试也没用"。
+///
+/// 鉴权、前置条件、找不到、Range 不满足这几类，是请求本身的问题，
+/// 重试 3 次只是白等退避时间（500ms + 1000ms），然后报同样的错。
+pub fn is_terminal_status(code: u16) -> bool {
+    matches!(code, 401 | 403 | 404 | 410 | 412 | 416 | 451)
+}
+
+/// 把上游状态码翻译成能直接看懂的原因。
+///
+/// 动机：实测夸克原画直链在**缺 Cookie** 时回 412，代理原样报
+/// `重试 3 次失败: 状态码: 412`，播放器只显示 ERROR_CODE_IO_BAD_HTTP_STATUS，
+/// 每次都得翻日志、对比 `player:` 里的 `headers=2` 还是 `headers=3` 才知道是鉴权问题。
+/// 现在把结论直接写进 502 的响应体。
+pub fn describe_upstream_status(code: u16) -> String {
+    let hint = match code {
+        401 => "上游要求身份认证，通常是 Cookie 缺失或已过期",
+        403 => "上游拒绝访问，通常是 Cookie 失效、防盗链校验失败（Referer/User-Agent 不符），或直链已被吊销",
+        404 => "上游找不到该资源，通常是文件已删除或直链结构变化",
+        410 => "上游资源已失效，需要重新获取直链",
+        // 夸克网盘原画直链的典型表现
+        412 => "上游前置条件校验失败，通常是 Cookie 缺失或已过期（夸克原画直链必须带 Cookie）",
+        416 => "上游认为请求的字节范围无效，通常是文件大小变化或直链已换",
+        429 => "上游限流，请求过于频繁",
+        451 => "上游因法律原因拒绝提供",
+        500..=599 => "上游服务端错误",
+        _ => "",
+    };
+    if hint.is_empty() {
+        format!("上游返回状态码 {code}")
+    } else {
+        format!("上游返回状态码 {code}（{hint}）")
     }
 }
 
@@ -641,6 +694,38 @@ mod tests {
         let (out, peak) = r.expect("单线程单槽位死锁");
         assert_eq!(out.len(), 20);
         assert!(peak <= 1);
+    }
+
+    /// 钉住实测过的那次线上故障：夸克原画直链缺 Cookie → 上游 412。
+    /// 错误文案必须直接点出 Cookie，否则只能靠翻日志比对 headers=2/3 才能定位。
+    #[test]
+    fn status_412_mentions_cookie() {
+        let s = describe_upstream_status(412);
+        assert!(s.contains("412"), "{s}");
+        assert!(s.contains("Cookie"), "412 必须提示 Cookie: {s}");
+    }
+
+    #[test]
+    fn auth_statuses_mention_cause() {
+        for code in [401, 403, 410] {
+            let s = describe_upstream_status(code);
+            assert!(s.contains(&code.to_string()), "{s}");
+            assert!(s.contains('（'), "{code} 应带原因说明: {s}");
+        }
+        // 未知码也要能读，不能是空字符串
+        let s = describe_upstream_status(418);
+        assert!(s.contains("418"), "{s}");
+    }
+
+    /// 鉴权类不该重试（白等退避），传输类错误仍要重试。
+    #[test]
+    fn terminal_vs_retryable() {
+        for code in [401, 403, 404, 410, 412, 416, 451] {
+            assert!(is_terminal_status(code), "{code} 应判定为不可重试");
+        }
+        for code in [429, 500, 502, 503, 504] {
+            assert!(!is_terminal_status(code), "{code} 应仍然重试");
+        }
     }
 
     /// 首块区间必须落在 [start, start+chunk) 内，且不越过客户端要求的结束位。
