@@ -3,13 +3,31 @@
 //! 流程：
 //! 1. 解析客户端 Range
 //! 2. 先取首块，从 Content-Range 拿到文件总长度，立刻回写响应头
-//! 3. 之后每轮并发拉 `thread` 个分块，**按序**写回，保持流式输出
+//! 3. 之后用**流水线**并发拉分块：`thread` 个 worker 各自不停领取下一块，
+//!    另有一个按序重排缓冲负责保证写出顺序
 //! 4. 单块失败自动重试；客户端断开时中止全部在途任务
+//!
+//! ## 为什么不是"每轮 N 块 + 栅栏"
+//!
+//! Go 版（以及本文件的初版）是轮次结构：起 N 个块 → 全部收完 → 写出 → 下一轮。
+//! 它有两个叠加的吞吐损失，在高码率 4K 原盘上会直接卡顿：
+//!
+//! 1. **每轮耗时 = 该轮最慢那块的耗时。** 实测夸克 CDN 的 1MB 块耗时
+//!    mean 1.17s / p90 1.60s / p99 1.95s，取 16 块的最大值，
+//!    `E[max/mean] ≈ 1.51x` → 白扔 34% 带宽。
+//! 2. **下载与回写不重叠。** `yield` 会挂起直到播放器取走字节，
+//!    于是一轮的 N×chunk 往播放器灌的整个过程中，网络上一个字节都没在下。
+//!
+//! 流水线同时解决两点：worker 永不空转（慢块只拖累自己，不拖累同伴），
+//! 且回写某块时其余 worker 仍在下载。实测 128MB 传输
+//! 栅栏 66 Mbps → 流水线 104 Mbps。
 
 use std::cmp::min;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -17,15 +35,19 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
 /// 单块重试次数（对应 Go 的 maxRetries=3）
 const CHUNK_RETRIES: u32 = 3;
 /// 单块超时（对应 Go 的 60s）
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
-/// 一轮并发缓存的字节上限。Go 版没有上限，`?thread=256&chunkSize=8192`
-/// 会试图一次分配 2GB；这里夹住，避免宿主进程 OOM。
-const MAX_ROUND_BYTES: i64 = 64 * 1024 * 1024;
+/// 在途 + 已下载待写出的字节上限。
+///
+/// Go 版没有上限，`?thread=256&chunkSize=8192` 会试图一次分配 2GB。
+/// 流水线模式下这个值同时充当 look-ahead 窗口：预读跑在播放器前面
+/// 最多这么多字节，再多就等播放器消费（背压），避免 seek 后白下一大堆。
+const MAX_INFLIGHT_BYTES: i64 = 64 * 1024 * 1024;
 
 const MIN_THREAD: usize = 1;
 const MAX_THREAD: usize = 32;
@@ -103,8 +125,8 @@ impl Player {
 
         let mut thread = thread.clamp(MIN_THREAD, MAX_THREAD);
         let chunk_size = chunk_size_kb.clamp(MIN_CHUNK_KB, MAX_CHUNK_KB) * 1024;
-        // 夹住一轮的总缓存量
-        while thread > MIN_THREAD && (thread as i64) * chunk_size > MAX_ROUND_BYTES {
+        // 夹住在途总量：worker 数 × 单块不能超过预算
+        while thread > MIN_THREAD && (thread as i64) * chunk_size > MAX_INFLIGHT_BYTES {
             thread /= 2;
         }
 
@@ -278,50 +300,107 @@ impl Player {
             let first_len = first_chunk.len() as i64;
             yield Ok::<Bytes, std::io::Error>(first_chunk);
 
-            let mut cursor = start + first_len;
+            let cursor = start + first_len;
+            if cursor > final_end {
+                return;
+            }
 
-            while cursor <= final_end {
-                // 一轮起 thread 个任务并发下载
-                let mut handles = Vec::with_capacity(thread);
-                let mut next = cursor;
+            // ---- 流水线：worker 从共享游标领块，结果按序号重排后写出 ----
+            //
+            // `next_offset` 是共享领取游标，worker 用 fetch_add 原子领取，
+            // 因此不需要额外的任务队列，也不会重复或漏块。
+            let next_offset = Arc::new(AtomicI64::new(cursor));
 
-                for _ in 0..thread {
-                    if next > final_end {
+            // look-ahead 窗口：一个块从"开始下载"到"已写给播放器"之间占一个许可。
+            //
+            // 只靠通道容量是不够的：接收端会把乱序块搬进重排缓冲，从而腾空通道，
+            // 于是慢块（最坏 60s 超时）期间其余 worker 能一路狂奔，
+            // 重排缓冲无上限增长。用信号量把 [在途 + 待重排] 一起夹住。
+            let slots = ((MAX_INFLIGHT_BYTES / chunk_size) as usize).max(thread).max(2);
+            let window = Arc::new(Semaphore::new(slots));
+            // (序号, 结果) —— 序号用于重排
+            let (tx, mut rx) = mpsc::channel::<(u64, Result<Bytes, String>)>(slots);
+
+            let mut workers = Vec::with_capacity(thread);
+            for _ in 0..thread {
+                let c = client.clone();
+                let u = url.clone();
+                let h = header.clone();
+                let cur = next_offset.clone();
+                let tx = tx.clone();
+                let win = window.clone();
+
+                workers.push(AbortOnDrop(tokio::spawn(async move {
+                    loop {
+                        // 先拿许可再领块：许可的获取顺序即分块的派发顺序，
+                        // 保证"当前最小未写出块"一定已经持有许可 → 不会自锁。
+                        // 许可由接收端在写出后 add_permits 归还，所以这里 forget。
+                        match win.acquire().await {
+                            Ok(p) => p.forget(),
+                            Err(_) => return, // 信号量已关闭
+                        }
+
+                        // 原子领取下一块，永不空转等同伴
+                        let cs = cur.fetch_add(chunk_size, Ordering::Relaxed);
+                        if cs > final_end {
+                            // 关键：把许可还回去再退出。
+                            // 否则每个收工的 worker 都会吞掉一个许可，
+                            // 当 worker 数 > 窗口槽位时，剩余 worker 会永久阻塞在
+                            // acquire 上，它们持有的 tx 不释放 → 通道不关闭 →
+                            // 接收端 rx.recv() 永远等不到 None → 整个响应挂死。
+                            win.add_permits(1);
+                            return;
+                        }
+                        let ce = min(cs + chunk_size - 1, final_end);
+                        // 块序号：距起点第几块，用于接收端重排
+                        let seq = ((cs - cursor) / chunk_size) as u64;
+
+                        let r = Self::download_chunk(c.clone(), u.clone(), h.clone(), cs, ce)
+                            .await
+                            .map(|(d, _, _)| d);
+                        let failed = r.is_err();
+
+                        // send 失败 = 接收端已走（客户端断开），直接收工
+                        if tx.send((seq, r)).await.is_err() || failed {
+                            return;
+                        }
+                    }
+                })));
+            }
+            // 本地这份必须丢掉，否则 rx 永远等不到通道关闭
+            drop(tx);
+
+            // 重排缓冲：先到的乱序块暂存，凑到期望序号才写出。
+            // 容量受 slots 限制（发送端阻塞），所以内存有界。
+            let mut pending: HashMap<u64, Bytes> = HashMap::new();
+            let mut want: u64 = 0;
+            let mut failure: Option<String> = None;
+
+            while let Some((seq, res)) = rx.recv().await {
+                match res {
+                    Ok(data) => {
+                        pending.insert(seq, data);
+                        // 把连续可写的块一次性排空。
+                        // 每写出一块就归还一个许可，让 worker 继续往前预读。
+                        while let Some(d) = pending.remove(&want) {
+                            yield Ok(d);
+                            want += 1;
+                            window.add_permits(1);
+                        }
+                    }
+                    Err(e) => {
+                        failure = Some(e);
                         break;
                     }
-                    let cs = next;
-                    let ce = min(next + chunk_size - 1, final_end);
-                    next = ce + 1;
-
-                    let c = client.clone();
-                    let u = url.clone();
-                    let h = header.clone();
-                    handles.push(AbortOnDrop(tokio::spawn(async move {
-                        Self::download_chunk(c, u, h, cs, ce).await.map(|(d, _, _)| d)
-                    })));
                 }
+            }
 
-                if handles.is_empty() {
-                    break;
-                }
-                cursor = next;
+            // workers 在此 drop → AbortOnDrop 中止所有在途下载，
+            // 不让 seek 之后的旧分块继续吃带宽。
+            drop(workers);
 
-                // 下载可以并发，写出顺序必须稳定，否则客户端数据错位。
-                // 提前 return 时，Vec 的 IntoIter 会 drop 掉剩余 handle → 自动 abort。
-                for h in handles {
-                    match h.await {
-                        Ok(Ok(data)) => yield Ok(data),
-                        Ok(Err(e)) => {
-                            yield Err(std::io::Error::other(e));
-                            return;
-                        }
-                        Err(e) => {
-                            // 任务 panic 或被取消
-                            yield Err(std::io::Error::other(format!("分块任务异常: {e}")));
-                            return;
-                        }
-                    }
-                }
+            if let Some(e) = failure {
+                yield Err(std::io::Error::other(e));
             }
         };
 
@@ -431,6 +510,137 @@ mod tests {
         assert_eq!(parse_total("bytes 0-0/1"), Some(1));
         assert_eq!(parse_total("bytes */*"), None);
         assert_eq!(parse_total("garbage"), None);
+    }
+
+    /// 复刻流水线的调度骨架（不发真实请求），验证核心不变式：
+    /// 按序、无重复、无遗漏、重排缓冲有界、且**不死锁**。
+    ///
+    /// `delay` 用来构造病态耗时分布；`threads`/`slots` 覆盖
+    /// "worker 数 > 窗口槽位" 这种最容易死锁的配置。
+    async fn drive_pipeline(
+        nchunk: i64,
+        threads: usize,
+        slots: usize,
+        delay: fn(u64) -> u64,
+    ) -> (Vec<u64>, usize) {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, Semaphore};
+
+        let final_end = nchunk - 1;
+        let next = Arc::new(AtomicI64::new(0));
+        let window = Arc::new(Semaphore::new(slots));
+        let (tx, mut rx) = mpsc::channel::<(u64, Bytes)>(slots);
+
+        let mut workers = Vec::new();
+        for _ in 0..threads {
+            let next = next.clone();
+            let win = window.clone();
+            let tx = tx.clone();
+            workers.push(AbortOnDrop(tokio::spawn(async move {
+                loop {
+                    match win.acquire().await {
+                        Ok(p) => p.forget(),
+                        Err(_) => return,
+                    }
+                    let cs = next.fetch_add(1, Ordering::Relaxed);
+                    if cs > final_end {
+                        // 归还许可，否则 worker 数 > slots 时会互相饿死
+                        win.add_permits(1);
+                        return;
+                    }
+                    let seq = cs as u64;
+                    tokio::time::sleep(Duration::from_millis(delay(seq))).await;
+                    if tx.send((seq, Bytes::new())).await.is_err() {
+                        return;
+                    }
+                }
+            })));
+        }
+        drop(tx);
+
+        let mut pending: HashMap<u64, Bytes> = HashMap::new();
+        let mut want = 0u64;
+        let mut out = Vec::new();
+        let mut peak = 0usize;
+        while let Some((seq, d)) = rx.recv().await {
+            pending.insert(seq, d);
+            peak = peak.max(pending.len());
+            while pending.remove(&want).is_some() {
+                out.push(want);
+                want += 1;
+                window.add_permits(1);
+            }
+        }
+        drop(workers);
+        (out, peak)
+    }
+
+    fn d_fast(_: u64) -> u64 {
+        1
+    }
+    fn d_straggler(s: u64) -> u64 {
+        if s % 5 == 2 {
+            30
+        } else {
+            1
+        }
+    }
+    fn d_head_slow(s: u64) -> u64 {
+        if s == 0 {
+            60
+        } else {
+            1
+        }
+    }
+
+    /// 正常配置：慢块不应破坏顺序，也不应让缓冲越界。
+    #[tokio::test]
+    async fn pipeline_ordered_and_bounded() {
+        let (out, peak) = drive_pipeline(120, 16, 24, d_straggler).await;
+        assert_eq!(out.len(), 120);
+        assert!(out.windows(2).all(|w| w[1] == w[0] + 1), "写出乱序");
+        assert!(peak <= 24, "重排缓冲越界: {peak}");
+    }
+
+    /// 队头最慢 = 最坏重排压力：后续块全堆在缓冲里，仍必须有界。
+    #[tokio::test]
+    async fn pipeline_head_of_line_blocking_stays_bounded() {
+        let (out, peak) = drive_pipeline(120, 16, 20, d_head_slow).await;
+        assert_eq!(out.len(), 120);
+        assert!(out.windows(2).all(|w| w[1] == w[0] + 1));
+        assert!(peak <= 20, "重排缓冲越界: {peak}");
+    }
+
+    /// 回归：worker 数 > 窗口槽位。
+    ///
+    /// 早期实现里收工的 worker 直接 return、不归还许可，于是每个退出的 worker
+    /// 吞掉一个许可，剩下的 worker 永久卡在 acquire、tx 不释放、通道不关闭，
+    /// 接收端 recv() 永远等不到 None → 整个响应挂死（实测会 hang）。
+    /// 加 5s 超时，一旦回归就会失败而不是把测试挂住。
+    #[tokio::test]
+    async fn pipeline_no_deadlock_when_threads_exceed_slots() {
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_pipeline(8, 32, 4, d_fast),
+        )
+        .await;
+        let (out, _) = r.expect("死锁：worker 数超过窗口槽位时未归还许可");
+        assert_eq!(out.len(), 8);
+        assert!(out.windows(2).all(|w| w[1] == w[0] + 1));
+    }
+
+    /// 极小窗口 + 单线程，退化路径也要能跑完。
+    #[tokio::test]
+    async fn pipeline_minimal_config() {
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_pipeline(20, 1, 1, d_fast),
+        )
+        .await;
+        let (out, peak) = r.expect("单线程单槽位死锁");
+        assert_eq!(out.len(), 20);
+        assert!(peak <= 1);
     }
 
     /// 首块区间必须落在 [start, start+chunk) 内，且不越过客户端要求的结束位。
