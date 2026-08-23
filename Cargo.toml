@@ -19,6 +19,10 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+
+[dev-dependencies]
+# 单测要 #[tokio::test]（macros）和 pause/advance 之外的真实定时（time 已在上面）
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 bytes = "1"
 async-stream = "0.3"
