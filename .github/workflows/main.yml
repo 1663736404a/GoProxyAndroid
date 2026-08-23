@@ -57,8 +57,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-android-
 
+      # 缓存命中时 ~/.cargo/bin/cargo-ndk 已存在，
+      # 此时 cargo install 会报 "binary already exists"（exit 101），故先探测
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+        run: |
+          if command -v cargo-ndk >/dev/null 2>&1; then
+            echo "cargo-ndk 已存在（缓存命中）: $(cargo-ndk --version)"
+          else
+            cargo install cargo-ndk --locked
+          fi
 
       - name: Run unit tests (host)
         run: cargo test --lib -- --test-threads=1
