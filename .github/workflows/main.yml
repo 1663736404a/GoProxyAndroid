@@ -76,8 +76,8 @@ jobs:
         run: |
           set -e
           mkdir -p "$OUT_DIR"
-          cp jniLibs/arm64-v8a/libproxy.so   "$OUT_DIR/proxy-android-arm64.so"
-          cp jniLibs/armeabi-v7a/libproxy.so "$OUT_DIR/proxy-android-arm.so"
+          cp jniLibs/arm64-v8a/libproxy.so   "$OUT_DIR/android-arm64.so"
+          cp jniLibs/armeabi-v7a/libproxy.so "$OUT_DIR/android-arm.so"
           ls -l "$OUT_DIR"
 
       - name: Verify exported JNI symbols
@@ -86,7 +86,7 @@ jobs:
         run: |
           set -e
           NM=$(find "$ANDROID_NDK_HOME" -name 'llvm-nm' | head -n1)
-          for so in "$OUT_DIR"/proxy-android-arm64.so "$OUT_DIR"/proxy-android-arm.so; do
+          for so in "$OUT_DIR"/android-arm64.so "$OUT_DIR"/android-arm.so; do
             echo "== $so =="
             for sym in startProxy stopProxy isProxyRunning getLastError; do
               full="Java_com_github_catvod_spider_GoProxyLibrary_$sym"
@@ -115,7 +115,7 @@ jobs:
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f "$OUT_DIR"/proxy-android-arm64.so "$OUT_DIR"/proxy-android-arm.so
+          git add -f "$OUT_DIR"/android-arm64.so "$OUT_DIR"/android-arm.so
           if git diff --cached --quiet; then
             echo "产物无变化，跳过提交"
           else
